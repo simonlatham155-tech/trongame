@@ -6,11 +6,8 @@ using UnityEngine.UI;
 namespace L4th4m
 {
     /// <summary>
-    /// Runs the intended arena opening:
-    /// character entrance -> jump/mount animation -> cycle activation -> countdown -> gameplay.
-    ///
-    /// This controller does not depend on a specific FBX path or animation clip name.
-    /// Wire the supplied Animator and trigger name in the Inspector.
+    /// Arena opening: character entrance -> jump/mount animation -> cycle activation
+    /// -> countdown -> gameplay. Supports both timed fallback and animation-event timing.
     /// </summary>
     public class OpeningSequenceDirector : MonoBehaviour
     {
@@ -23,17 +20,16 @@ namespace L4th4m
         [SerializeField] private MonoBehaviour[] gameplayScripts;
 
         [Header("Animation")]
-        [Tooltip("Animator trigger that starts the supplied jump/mount-lightcycle animation.")]
         [SerializeField] private string mountTrigger = "MountLightcycle";
-        [Tooltip("Delay after the sequence starts before the mount animation is triggered.")]
         [SerializeField] private float preMountDelay = 0.75f;
-        [Tooltip("Time from mount trigger until the rider is considered seated on the bike.")]
         [SerializeField] private float mountDuration = 2.0f;
+        [Tooltip("When enabled, animation events call CycleMountPoint() and MountAnimationFinished().")]
+        [SerializeField] private bool useAnimationEvents = true;
 
         [Header("Cycle reveal")]
         [SerializeField] private bool hideCycleUntilMount = false;
         [SerializeField] private Behaviour[] cycleEffects;
-        [SerializeField] private float cycleActivationDelay = 0.35f;
+        [SerializeField] private float timedCycleActivationDelay = 0.35f;
 
         [Header("Countdown")]
         [SerializeField] private Text countdownText;
@@ -48,40 +44,33 @@ namespace L4th4m
         public UnityEvent onGameplayStarted;
 
         private bool running;
+        private bool cycleActivated;
+        private bool mountFinished;
 
         private void Awake()
         {
             SetGameplayEnabled(false);
 
-            if (cinematicCamera != null)
-                cinematicCamera.enabled = true;
-
-            if (gameplayCamera != null)
-                gameplayCamera.enabled = false;
-
-            if (countdownText != null)
-                countdownText.gameObject.SetActive(false);
-
-            if (hideCycleUntilMount && lightcycleRoot != null)
-                lightcycleRoot.SetActive(false);
+            if (cinematicCamera != null) cinematicCamera.enabled = true;
+            if (gameplayCamera != null) gameplayCamera.enabled = false;
+            if (countdownText != null) countdownText.gameObject.SetActive(false);
+            if (hideCycleUntilMount && lightcycleRoot != null) lightcycleRoot.SetActive(false);
 
             SetCycleEffects(false);
         }
 
-        private void Start()
-        {
-            StartOpening();
-        }
+        private void Start() => StartOpening();
 
         public void StartOpening()
         {
-            if (!running)
-                StartCoroutine(RunOpening());
+            if (!running) StartCoroutine(RunOpening());
         }
 
         private IEnumerator RunOpening()
         {
             running = true;
+            cycleActivated = false;
+            mountFinished = false;
             onSequenceStarted?.Invoke();
 
             yield return new WaitForSeconds(preMountDelay);
@@ -90,24 +79,27 @@ namespace L4th4m
             if (characterAnimator != null && !string.IsNullOrWhiteSpace(mountTrigger))
                 characterAnimator.SetTrigger(mountTrigger);
 
-            yield return new WaitForSeconds(cycleActivationDelay);
+            if (useAnimationEvents)
+            {
+                // Safety fallback prevents a bad/missing Animation Event from hanging the intro.
+                float timeout = Mathf.Max(0.25f, mountDuration + 1.0f);
+                float elapsed = 0f;
+                while (!mountFinished && elapsed < timeout)
+                {
+                    elapsed += Time.deltaTime;
+                    yield return null;
+                }
 
-            if (lightcycleRoot != null)
-                lightcycleRoot.SetActive(true);
+                if (!cycleActivated) ActivateCycle();
+            }
+            else
+            {
+                yield return new WaitForSeconds(timedCycleActivationDelay);
+                ActivateCycle();
+                yield return new WaitForSeconds(Mathf.Max(0f, mountDuration - timedCycleActivationDelay));
+            }
 
-            SetCycleEffects(true);
-            onCycleActivated?.Invoke();
-
-            float remainingMountTime = Mathf.Max(0f, mountDuration - cycleActivationDelay);
-            if (remainingMountTime > 0f)
-                yield return new WaitForSeconds(remainingMountTime);
-
-            // Once the mount animation has completed, the separate entrance character
-            // can be hidden if the gameplay lightcycle already contains the rider model.
-            if (characterRoot != null)
-                characterRoot.SetActive(false);
-
-            SwitchToGameplayCamera();
+            CompleteMountAndStartCountdown();
             yield return StartCoroutine(RunCountdown());
 
             SetGameplayEnabled(true);
@@ -115,13 +107,46 @@ namespace L4th4m
             running = false;
         }
 
+        /// <summary>
+        /// Add an Animation Event with function name "CycleMountPoint" at the frame where
+        /// the rider reaches/touches the lightcycle. This reveals/energises the bike exactly
+        /// in sync with the supplied jump-on-lightcycle animation.
+        /// </summary>
+        public void CycleMountPoint()
+        {
+            ActivateCycle();
+        }
+
+        /// <summary>
+        /// Add an Animation Event with function name "MountAnimationFinished" on the final
+        /// seated frame of the supplied mount clip.
+        /// </summary>
+        public void MountAnimationFinished()
+        {
+            mountFinished = true;
+        }
+
+        private void ActivateCycle()
+        {
+            if (cycleActivated) return;
+            cycleActivated = true;
+
+            if (lightcycleRoot != null) lightcycleRoot.SetActive(true);
+            SetCycleEffects(true);
+            onCycleActivated?.Invoke();
+        }
+
+        private void CompleteMountAndStartCountdown()
+        {
+            if (characterRoot != null) characterRoot.SetActive(false);
+            SwitchToGameplayCamera();
+        }
+
         private IEnumerator RunCountdown()
         {
-            if (countdownText == null)
-                yield break;
+            if (countdownText == null) yield break;
 
             countdownText.gameObject.SetActive(true);
-
             for (int value = 3; value >= 1; value--)
             {
                 countdownText.text = value.ToString();
@@ -135,35 +160,22 @@ namespace L4th4m
 
         private void SwitchToGameplayCamera()
         {
-            if (cinematicCamera != null)
-                cinematicCamera.enabled = false;
-
-            if (gameplayCamera != null)
-                gameplayCamera.enabled = true;
+            if (cinematicCamera != null) cinematicCamera.enabled = false;
+            if (gameplayCamera != null) gameplayCamera.enabled = true;
         }
 
         private void SetGameplayEnabled(bool enabled)
         {
-            if (gameplayScripts == null)
-                return;
-
+            if (gameplayScripts == null) return;
             foreach (MonoBehaviour script in gameplayScripts)
-            {
-                if (script != null)
-                    script.enabled = enabled;
-            }
+                if (script != null) script.enabled = enabled;
         }
 
         private void SetCycleEffects(bool enabled)
         {
-            if (cycleEffects == null)
-                return;
-
+            if (cycleEffects == null) return;
             foreach (Behaviour effect in cycleEffects)
-            {
-                if (effect != null)
-                    effect.enabled = enabled;
-            }
+                if (effect != null) effect.enabled = enabled;
         }
     }
 }
